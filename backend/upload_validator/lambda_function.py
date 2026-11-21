@@ -1,22 +1,19 @@
 """olist_upload_validator: checks a CSV uploaded from the website, then hands it to the pipeline.
 
 Trigger: S3 "object created" on s3://<BUCKET>/raw/uploads_incoming/  (suffix .csv)
+The file arrives as raw/uploads_incoming/<table>/<upload_id>.csv  - one file = one Olist table.
 
-CSV columns (one row per order item; rows with the same order_id form one order):
-  required  order_id, customer_id, order_purchase_timestamp, product_id, seller_id,
-            price, freight_value, payment_type
-  optional  order_status (default delivered), order_estimated_delivery_date (default +20 days),
-            order_delivered_customer_date, payment_installments (default 1)
+The CSV has the same columns as the original Olist file of that table (see TABLES below).
+Checks, row by row:
+  - required columns present, formats (ids, dates, numbers, zip codes, states), allowed values
+  - table rules (for example: a delivered order needs a delivery date)
+  - no duplicate key inside the file
+  - references exist: customer / product / seller / order / category must already be in
+    Redshift OR in an earlier website upload (so you can upload a new customer, then its order)
+If the key already exists, the uploaded row REPLACES the old one when the pipeline runs (update).
 
-Checks: column names, formats, dates, numbers, allowed values, the same order details on every
-row of one order, and (in Redshift) that the customer / product / seller exist and that the
-order_id is new.
-
-If every row is valid, writes JSON Lines that Glue job 1 reads with data_source = 'upload':
-  raw/upload_orders/upload_id=<id>/data.jsonl
-  raw/upload_order_items/upload_id=<id>/data.jsonl
-  raw/upload_payments/upload_id=<id>/data.jsonl
-One bad row rejects the whole file (nothing half-loaded). The result goes to DynamoDB.
+All rows valid -> raw/upload_<table>/upload_id=<id>/data.jsonl, which Glue job 1 reads with
+data_source = 'upload'. One bad row rejects the whole file. The result goes to DynamoDB.
 
 Environment variables:
   TABLE       olist_uploads
@@ -32,28 +29,120 @@ import re
 import time
 import urllib.parse
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import boto3
 
 s3 = boto3.client("s3")
 rsd = boto3.client("redshift-data")
-TABLE = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+DDB = boto3.resource("dynamodb").Table(os.environ["TABLE"])
 
-MAX_ROWS = 500
-REQUIRED = ["order_id", "customer_id", "order_purchase_timestamp", "product_id", "seller_id",
-            "price", "freight_value", "payment_type"]
-OPTIONAL = ["order_status", "order_estimated_delivery_date", "order_delivered_customer_date",
-            "payment_installments"]
-STATUSES = {"created", "approved", "invoiced", "processing", "shipped", "delivered",
-            "canceled", "unavailable"}
-PAYMENT_TYPES = {"credit_card", "boleto", "voucher", "debit_card"}
-ORDER_FIELDS = ["customer_id", "order_status", "order_purchase_timestamp",
-                "order_estimated_delivery_date", "order_delivered_customer_date",
-                "payment_type", "payment_installments"]
-ID = re.compile(r"^[0-9a-f]{32}$")  # Olist ids: 32 lowercase hex characters
+MAX_ROWS = 1000
+STATUSES = ["created", "approved", "invoiced", "processing", "shipped", "delivered",
+            "canceled", "unavailable"]
+PAYMENT_TYPES = ["credit_card", "boleto", "voucher", "debit_card", "not_defined"]
+STATES = ["AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT", "PA",
+          "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO"]
+
+
+def col(name, kind, required=False, **rules):
+    return {"name": name, "kind": kind, "required": required, **rules}
+
+
+# The columns of every table, exactly as in the original Olist CSV files.
+# kind: id (32 hex) | text | int | num | ts (date/time) | zip | state | enum | category
+TABLES = {
+    "orders": {"key": ["order_id"], "cols": [
+        col("order_id", "id", True),
+        col("customer_id", "id", True, ref="customer"),
+        col("order_status", "enum", True, values=STATUSES),
+        col("order_purchase_timestamp", "ts", True),
+        col("order_approved_at", "ts"),
+        col("order_delivered_carrier_date", "ts"),
+        col("order_delivered_customer_date", "ts"),
+        col("order_estimated_delivery_date", "ts")]},
+    "order_items": {"key": ["order_id", "order_item_id"], "cols": [
+        col("order_id", "id", True, ref="order"),
+        col("order_item_id", "int", True, min=1, max=100),
+        col("product_id", "id", True, ref="product"),
+        col("seller_id", "id", True, ref="seller"),
+        col("shipping_limit_date", "ts"),
+        col("price", "num", True, min=0.01, max=100000),
+        col("freight_value", "num", True, min=0, max=10000)]},
+    "payments": {"key": ["order_id", "payment_sequential"], "cols": [
+        col("order_id", "id", True, ref="order"),
+        col("payment_sequential", "int", True, min=1, max=50),
+        col("payment_type", "enum", True, values=PAYMENT_TYPES),
+        col("payment_installments", "int", True, min=0, max=24),
+        col("payment_value", "num", True, min=0, max=100000)]},
+    "reviews": {"key": ["review_id", "order_id"], "cols": [
+        col("review_id", "id", True),
+        col("order_id", "id", True, ref="order"),
+        col("review_score", "int", True, min=1, max=5),
+        col("review_comment_title", "text"),
+        col("review_comment_message", "text"),
+        col("review_creation_date", "ts", True),
+        col("review_answer_timestamp", "ts")]},
+    "customers": {"key": ["customer_id"], "cols": [
+        col("customer_id", "id", True),
+        col("customer_unique_id", "id", True),
+        col("customer_zip_code_prefix", "zip", True),
+        col("customer_city", "text", True),
+        col("customer_state", "state", True)]},
+    "sellers": {"key": ["seller_id"], "cols": [
+        col("seller_id", "id", True),
+        col("seller_zip_code_prefix", "zip", True),
+        col("seller_city", "text", True),
+        col("seller_state", "state", True)]},
+    "products": {"key": ["product_id"], "cols": [
+        col("product_id", "id", True),
+        col("product_category_name", "category", True, ref="category"),
+        col("product_name_lenght", "int", min=0, max=1000),
+        col("product_description_lenght", "int", min=0, max=10000),
+        col("product_photos_qty", "int", min=0, max=50),
+        col("product_weight_g", "int", min=0, max=100000),
+        col("product_length_cm", "int", min=0, max=500),
+        col("product_height_cm", "int", min=0, max=500),
+        col("product_width_cm", "int", min=0, max=500)]},
+    "category_translation": {"key": ["product_category_name"], "cols": [
+        col("product_category_name", "category", True),
+        col("product_category_name_english", "category", True)]},
+    "geolocation": {"key": [], "cols": [
+        col("geolocation_zip_code_prefix", "zip", True),
+        col("geolocation_lat", "num", True, min=-34, max=6),
+        col("geolocation_lng", "num", True, min=-74, max=-34),
+        col("geolocation_city", "text", True),
+        col("geolocation_state", "state", True)]},
+}
+
+# where each kind of reference is looked up: Redshift (table, column) and earlier uploads
+REFS = {
+    "customer": ("olist.dim_customer", "customer_id", "customers", "customer_id"),
+    "product": ("olist.dim_product", "product_id", "products", "product_id"),
+    "seller": ("olist.dim_seller", "seller_id", "sellers", "seller_id"),
+    "order": ("olist.fact_orders", "order_id", "orders", "order_id"),
+    "category": ("olist.dim_product", "category_pt", "category_translation", "product_category_name"),
+}
+
+ID = re.compile(r"^[0-9a-f]{32}$")
+CATEGORY = re.compile(r"^[a-z0-9_]{1,60}$")
 TS_FORMATS = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
               "%Y-%m-%d"]
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def set_status(upload_id, status, message, **extra):
+    names = {"#s": "status", "#m": "message", "#u": "updated_at"}
+    values = {":s": status, ":m": message, ":u": now()}
+    sets = ["#s = :s", "#m = :m", "#u = :u"]
+    for i, (k, v) in enumerate(extra.items()):
+        names[f"#x{i}"], values[f":x{i}"] = k, v
+        sets.append(f"#x{i} = :x{i}")
+    DDB.update_item(Key={"upload_id": upload_id}, UpdateExpression="SET " + ", ".join(sets),
+                    ExpressionAttributeNames=names, ExpressionAttributeValues=values)
 
 
 def parse_ts(text):
@@ -65,97 +154,91 @@ def parse_ts(text):
     return None
 
 
-def fmt_ts(dt):
-    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else None
-
-
-def set_status(upload_id, status, message, **extra):
-    names = {"#s": "status", "#m": "message", "#u": "updated_at"}
-    values = {":s": status, ":m": message, ":u": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    sets = ["#s = :s", "#m = :m", "#u = :u"]
-    for i, (k, v) in enumerate(extra.items()):
-        names[f"#x{i}"], values[f":x{i}"] = k, v
-        sets.append(f"#x{i} = :x{i}")
-    TABLE.update_item(Key={"upload_id": upload_id}, UpdateExpression="SET " + ", ".join(sets),
-                      ExpressionAttributeNames=names, ExpressionAttributeValues=values)
-
-
-def check_rows(rows):
-    """Format checks. Returns (orders, errors); orders = {order_id: {"order": {...}, "items": [...]}}."""
-    errors, orders = [], {}
-    for n, row in enumerate(rows, start=2):  # row 1 is the header
-        def bad(msg):
-            errors.append(f"row {n}: {msg}")
-
-        for col in REQUIRED:
-            if not row.get(col):
-                bad(f"{col} is empty")
-        if any(not row.get(c) for c in REQUIRED):
-            continue
-
-        for col in ("order_id", "customer_id", "product_id", "seller_id"):
-            if not ID.match(row[col]):
-                bad(f"{col} must be 32 characters 0-9 / a-f (got '{row[col][:40]}')")
-
-        status = (row.get("order_status") or "delivered").lower()
-        if status not in STATUSES:
-            bad(f"order_status '{status}' is not one of {sorted(STATUSES)}")
-
-        purchase = parse_ts(row["order_purchase_timestamp"])
-        if not purchase:
-            bad("order_purchase_timestamp must look like 2018-10-25 14:30:00")
-        elif purchase > datetime.utcnow() + timedelta(days=1):
-            bad("order_purchase_timestamp is in the future")
-        estimated = (parse_ts(row["order_estimated_delivery_date"])
-                     if row.get("order_estimated_delivery_date")
-                     else purchase and purchase + timedelta(days=20))
-        if row.get("order_estimated_delivery_date") and not estimated:
-            bad("order_estimated_delivery_date is not a valid date")
-        delivered = None
-        if row.get("order_delivered_customer_date"):
-            delivered = parse_ts(row["order_delivered_customer_date"])
-            if not delivered:
-                bad("order_delivered_customer_date is not a valid date")
-        # compare whole days: delivered "2026-11-21" on the purchase day is fine
-        if purchase and delivered and delivered.date() < purchase.date():
-            bad("order_delivered_customer_date is before the purchase")
-        if purchase and estimated and estimated.date() < purchase.date():
-            bad("order_estimated_delivery_date is before the purchase")
-        if status == "delivered" and not delivered:
-            bad("a delivered order needs order_delivered_customer_date")
-
+def convert(c, raw):
+    """One cell -> (clean value, error message or None)."""
+    value = raw.strip()
+    if value == "":
+        return None, (f"{c['name']} is required" if c["required"] else None)
+    kind = c["kind"]
+    if kind == "id":
+        value = value.lower()
+        return value, None if ID.match(value) else f"{c['name']} must be 32 characters 0-9 / a-f"
+    if kind == "category":
+        value = value.lower().replace(" ", "_")
+        return value, None if CATEGORY.match(value) else f"{c['name']} may only use a-z, 0-9 and _"
+    if kind == "text":
+        return re.sub(r"\s+", " ", value)[:500], None
+    if kind == "enum":
+        value = value.lower()
+        return value, None if value in c["values"] else f"{c['name']} must be one of {', '.join(c['values'])}"
+    if kind == "state":
+        value = value.upper()
+        return value, None if value in STATES else f"{c['name']} must be a Brazilian state code like SP"
+    if kind == "zip":
+        digits = value.split(".")[0]
+        if not digits.isdigit() or len(digits) > 5:
+            return value, f"{c['name']} must be up to 5 digits, like 01310"
+        return digits.zfill(5), None
+    if kind == "ts":
+        dt = parse_ts(value)
+        if not dt:
+            return value, f"{c['name']} must look like 2018-10-25 14:30:00"
+        if dt > datetime.utcnow() + timedelta(days=400):
+            return value, f"{c['name']} is too far in the future"
+        return dt.strftime("%Y-%m-%d %H:%M:%S"), None
+    if kind in ("int", "num"):
         try:
-            price, freight = Decimal(row["price"]), Decimal(row["freight_value"])
-            if not (Decimal("0") < price <= Decimal("100000")):
-                bad("price must be between 0.01 and 100000")
-            if not (Decimal("0") <= freight <= Decimal("10000")):
-                bad("freight_value must be between 0 and 10000")
-        except Exception:
-            bad("price and freight_value must be numbers like 129.90")
-            price = freight = None
+            number = Decimal(value)
+        except InvalidOperation:
+            return value, f"{c['name']} must be a number"
+        if kind == "int" and number != number.to_integral_value():
+            return value, f"{c['name']} must be a whole number"
+        if not (Decimal(str(c.get("min", -1e12))) <= number <= Decimal(str(c.get("max", 1e12)))):
+            return value, f"{c['name']} must be between {c.get('min')} and {c.get('max')}"
+        return (int(number) if kind == "int" else str(number)), None
+    return value, None
 
-        ptype = row["payment_type"].lower()
-        if ptype not in PAYMENT_TYPES:
-            bad(f"payment_type '{ptype}' is not one of {sorted(PAYMENT_TYPES)}")
-        inst = row.get("payment_installments") or "1"
-        if not inst.isdigit() or not 1 <= int(inst) <= 24:
-            bad("payment_installments must be a whole number from 1 to 24")
 
-        if errors and errors[-1].startswith(f"row {n}:"):
-            continue
-        order = {"customer_id": row["customer_id"], "order_status": status,
-                 "order_purchase_timestamp": fmt_ts(purchase),
-                 "order_estimated_delivery_date": fmt_ts(estimated),
-                 "order_delivered_customer_date": fmt_ts(delivered),
-                 "payment_type": ptype, "payment_installments": int(inst)}
-        entry = orders.setdefault(row["order_id"], {"order": order, "items": []})
-        diff = [f for f in ORDER_FIELDS if entry["order"][f] != order[f]]
-        if diff:
-            bad(f"order {row['order_id'][:8]}… has different {', '.join(diff)} than its first row")
-            continue
-        entry["items"].append({"product_id": row["product_id"], "seller_id": row["seller_id"],
-                               "price": price, "freight_value": freight})
-    return orders, errors
+def table_rules(table, r):
+    """Checks that need more than one column."""
+    errs = []
+    if table == "orders":
+        purchase = r["order_purchase_timestamp"]
+        for c in ("order_approved_at", "order_delivered_carrier_date",
+                  "order_delivered_customer_date", "order_estimated_delivery_date"):
+            if purchase and r.get(c) and r[c][:10] < purchase[:10]:
+                errs.append(f"{c} is before the purchase date")
+        if purchase and purchase > now().replace("T", " ")[:19]:
+            errs.append("order_purchase_timestamp is in the future")
+        if r["order_status"] == "delivered" and not r.get("order_delivered_customer_date"):
+            errs.append("a delivered order needs order_delivered_customer_date")
+    if table == "reviews" and r.get("review_answer_timestamp") and r.get("review_creation_date") \
+            and r["review_answer_timestamp"][:10] < r["review_creation_date"][:10]:
+        errs.append("review_answer_timestamp is before review_creation_date")
+    return errs
+
+
+def check_rows(table, rows):
+    """Returns (clean rows, errors)."""
+    spec = TABLES[table]
+    clean, errors, seen = [], [], {}
+    for n, row in enumerate(rows, start=2):  # row 1 is the header
+        out, row_errs = {}, []
+        for c in spec["cols"]:
+            value, err = convert(c, row.get(c["name"], ""))
+            out[c["name"]] = value
+            if err:
+                row_errs.append(err)
+        if not row_errs:
+            row_errs = table_rules(table, out)
+        if not row_errs and spec["key"]:
+            key = tuple(out[k] for k in spec["key"])
+            if key in seen:
+                row_errs.append(f"same {' + '.join(spec['key'])} as row {seen[key]}")
+            seen[key] = n
+        errors += [f"row {n}: {e}" for e in row_errs]
+        clean.append(out)
+    return clean, errors
 
 
 def run_sql(sql):
@@ -178,81 +261,78 @@ def run_sql(sql):
             for rec in rsd.get_statement_result(Id=sid)["Records"]]
 
 
-def check_in_redshift(orders):
-    """Customers, products and sellers must exist; order ids must be new.
-    Every id was already checked to be 32 hex characters, so it is safe inside the SQL."""
-    ids = {"customer": {o["order"]["customer_id"] for o in orders.values()},
-           "product": {i["product_id"] for o in orders.values() for i in o["items"]},
-           "seller": {i["seller_id"] for o in orders.values() for i in o["items"]},
-           "order": set(orders)}
-    lists = {k: ",".join(f"'{v}'" for v in sorted(vals)) for k, vals in ids.items()}
-    sql = f"""
-        SELECT DISTINCT 'customer', customer_id FROM olist.dim_customer WHERE customer_id IN ({lists['customer']})
-        UNION ALL SELECT DISTINCT 'product', product_id FROM olist.dim_product WHERE product_id IN ({lists['product']})
-        UNION ALL SELECT DISTINCT 'seller', seller_id FROM olist.dim_seller WHERE seller_id IN ({lists['seller']})
-        UNION ALL SELECT DISTINCT 'order', order_id FROM olist.fact_orders WHERE order_id IN ({lists['order']})"""
-    found = {k: set() for k in ids}
-    for kind, value in run_sql(sql):
-        found[kind].add(value)
+def uploaded_values(bucket, table, column):
+    """Values of one column in every earlier website upload of that table (not loaded yet, maybe)."""
+    values, token = set(), None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": f"raw/upload_{table}/"}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = s3.list_objects_v2(**kwargs)
+        for obj in page.get("Contents", []):
+            body = s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read().decode("utf-8")
+            for line in body.splitlines():
+                if line.strip():
+                    values.add(json.loads(line).get(column))
+        if not page.get("IsTruncated"):
+            return values
+        token = page["NextContinuationToken"]
+
+
+def check_refs(bucket, table, rows):
+    """Every referenced id must exist in Redshift or in an earlier upload.
+    Ids and category names were already checked against strict patterns, so they are safe in SQL."""
+    wanted = {}
+    for c in TABLES[table]["cols"]:
+        if c.get("ref"):
+            wanted.setdefault(c["ref"], set()).update(r[c["name"]] for r in rows if r[c["name"]])
+    if not wanted:
+        return []
+    parts = []
+    for ref, vals in wanted.items():
+        rs_table, rs_col = REFS[ref][:2]
+        in_list = ",".join(f"'{v}'" for v in sorted(vals))
+        parts.append(f"SELECT DISTINCT '{ref}', {rs_col} FROM {rs_table} WHERE {rs_col} IN ({in_list})")
+    found = {ref: set() for ref in wanted}
+    for ref, value in run_sql("\nUNION ALL ".join(parts)):
+        found[ref].add(value)
 
     errors = []
-    for kind in ("customer", "product", "seller"):
-        for missing in sorted(ids[kind] - found[kind]):
-            errors.append(f"{kind}_id {missing} does not exist in Redshift")
-    for existing in sorted(found["order"]):
-        errors.append(f"order_id {existing} already exists (use a new order_id)")
+    for ref, vals in wanted.items():
+        missing = vals - found[ref]
+        if missing:  # maybe uploaded earlier from the website and not in Redshift yet
+            missing -= uploaded_values(bucket, *REFS[ref][2:])
+        for m in sorted(missing):
+            errors.append(f"{ref} '{m}' does not exist (upload it first in the {REFS[ref][2]} table)")
     return errors
 
 
-def write_jsonl(bucket, key, rows):
-    body = "\n".join(json.dumps(r, default=str) for r in rows) + "\n"
-    s3.put_object(Bucket=bucket, Key=key, Body=body.encode("utf-8"),
-                  ContentType="application/x-ndjson")
-
-
-def to_pipeline(bucket, upload_id, orders):
-    """Same column names as the Olist tables, so Glue job 1 treats them like any other source."""
-    o_rows, i_rows, p_rows = [], [], []
-    for order_id, o in orders.items():
-        order = o["order"]
-        purchase = order["order_purchase_timestamp"]
-        o_rows.append({"order_id": order_id, "customer_id": order["customer_id"],
-                       "order_status": order["order_status"],
-                       "order_purchase_timestamp": purchase, "order_approved_at": purchase,
-                       "order_delivered_carrier_date": None,
-                       "order_delivered_customer_date": order["order_delivered_customer_date"],
-                       "order_estimated_delivery_date": order["order_estimated_delivery_date"]})
-        total = Decimal("0")
-        for n, item in enumerate(o["items"], start=1):
-            i_rows.append({"order_id": order_id, "order_item_id": n,
-                           "product_id": item["product_id"], "seller_id": item["seller_id"],
-                           "shipping_limit_date": purchase,
-                           "price": item["price"], "freight_value": item["freight_value"]})
-            total += item["price"] + item["freight_value"]
-        p_rows.append({"order_id": order_id, "payment_sequential": 1,
-                       "payment_type": order["payment_type"],
-                       "payment_installments": order["payment_installments"],
-                       "payment_value": total})
-    for table, rows in (("orders", o_rows), ("order_items", i_rows), ("payments", p_rows)):
-        write_jsonl(bucket, f"raw/upload_{table}/upload_id={upload_id}/data.jsonl", rows)
-    return len(o_rows), len(i_rows), sum((p["payment_value"] for p in p_rows), Decimal("0"))
+def read_csv(text):
+    reader = csv.DictReader(io.StringIO(text))
+    header = [(h or "").strip().lower() for h in (reader.fieldnames or [])]
+    reader.fieldnames = header
+    rows = [{k: (v or "") for k, v in r.items() if k}
+            for r in reader if any((v or "").strip() for v in r.values() if isinstance(v, str))]
+    return header, rows
 
 
 def validate(bucket, key):
-    upload_id = key.rsplit("/", 1)[-1].removesuffix(".csv")
+    parts = key.split("/")
+    upload_id, table = parts[-1].removesuffix(".csv"), parts[-2]
     set_status(upload_id, "VALIDATING", "Checking the file")
+    if table not in TABLES:
+        set_status(upload_id, "REJECTED", f"Unknown table '{table}'", errors=[])
+        return
 
     text = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8-sig", "replace")
-    reader = csv.DictReader(io.StringIO(text))
-    header = [h.strip().lower() for h in (reader.fieldnames or [])]
-    missing = [c for c in REQUIRED if c not in header]
+    header, rows = read_csv(text)
+    required = [c["name"] for c in TABLES[table]["cols"] if c["required"]]
+    missing = [c for c in required if c not in header]
     if missing:
         set_status(upload_id, "REJECTED", f"Missing columns: {', '.join(missing)}",
-                   errors=[f"the header row must contain: {', '.join(REQUIRED)}"])
+                   errors=[f"the header row of a {table} file must contain: "
+                           + ", ".join(c["name"] for c in TABLES[table]["cols"])])
         return
-    reader.fieldnames = header
-    rows = [{k: (v or "").strip() for k, v in r.items() if k} for r in reader
-            if any((v or "").strip() for v in r.values() if isinstance(v, str))]
     if not rows:
         set_status(upload_id, "REJECTED", "The file has no data rows", errors=[])
         return
@@ -261,19 +341,19 @@ def validate(bucket, key):
                    errors=[], row_count=len(rows))
         return
 
-    orders, errors = check_rows(rows)
+    clean, errors = check_rows(table, rows)
     if not errors:
-        errors = check_in_redshift(orders)
+        errors = check_refs(bucket, table, clean)
     if errors:
         set_status(upload_id, "REJECTED", f"{len(errors)} problem(s) found; nothing was loaded",
                    errors=errors[:20], row_count=len(rows))
         return
 
-    n_orders, n_items, total = to_pipeline(bucket, upload_id, orders)
-    set_status(upload_id, "READY",
-               "Valid. It will be loaded into Redshift by the next pipeline run",
-               errors=[], row_count=len(rows), order_count=n_orders, item_count=n_items,
-               total_value=total)
+    body = "\n".join(json.dumps(r, ensure_ascii=False) for r in clean) + "\n"
+    s3.put_object(Bucket=bucket, Key=f"raw/upload_{table}/upload_id={upload_id}/data.jsonl",
+                  Body=body.encode("utf-8"), ContentType="application/x-ndjson")
+    set_status(upload_id, "READY", "Valid. It will be loaded into Redshift by the next pipeline run",
+               errors=[], row_count=len(clean))
 
 
 def lambda_handler(event, context):

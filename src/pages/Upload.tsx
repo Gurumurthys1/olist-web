@@ -2,32 +2,30 @@ import { useCallback, useEffect, useState } from 'react'
 import { apiGet, apiPost } from '../api'
 import { config } from '../config'
 import { useUser } from '../useUser'
-import {
-  CUSTOMERS, PAYMENT_TYPES, PRODUCTS, SELLERS, STATUSES, newOrderId, templateCsv, toCsv,
-} from '../samples'
+import { SUGGESTIONS, newId, recentIds, rememberId, toCsv } from '../samples'
+import { STATES, TABLES, type Column, type TableSpec } from '../tables'
 
 type UploadRow = {
-  upload_id: string; created_at: string; user_email: string; filename: string
-  status: string; message: string; errors?: string[]
-  row_count?: string; order_count?: string; item_count?: string; total_value?: string
+  upload_id: string; created_at: string; user_email: string; filename: string; table_name?: string
+  status: string; message: string; errors?: string[]; row_count?: string; order_count?: string
 }
-type Item = { product_id: string; seller_id: string; price: string; freight_value: string }
-
-const today = () => new Date().toISOString().slice(0, 10)
-const plusDays = (d: string, n: number) => {
-  const x = new Date(d); x.setDate(x.getDate() + n); return x.toISOString().slice(0, 10)
-}
+type Preview = { columns: string[]; sample: Record<string, unknown>[]; uploaded: Record<string, unknown>[] }
 
 /** Ask the API for a presigned URL, then send the CSV straight to S3. */
-async function sendCsv(filename: string, csv: Blob, idToken: string) {
-  const { url, upload_id } = await apiPost<{ url: string; upload_id: string }>('/uploads', { filename }, idToken)
+async function sendCsv(table: string, filename: string, csv: Blob, idToken: string) {
+  const { url, upload_id } = await apiPost<{ url: string; upload_id: string }>('/uploads', { table, filename }, idToken)
   const res = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'text/csv' }, body: csv })
   if (!res.ok) throw new Error(`S3 upload failed: ${res.status} ${await res.text()}`)
   return upload_id
 }
 
+/** Example row for the template: generated ids where no example is given. */
+const exampleRow = (t: TableSpec) =>
+  Object.fromEntries(t.columns.map((col) => [col.name, col.example || (col.kind === 'id' ? newId() : '')]))
+
 export default function Upload() {
   const { isAdmin, idToken } = useUser()
+  const [table, setTable] = useState<TableSpec>(TABLES[0])
   const [uploads, setUploads] = useState<UploadRow[]>([])
   const [listError, setListError] = useState('')
   const [msg, setMsg] = useState('')
@@ -49,7 +47,10 @@ export default function Upload() {
     return () => clearInterval(t)
   }, [busy, load])
 
-  const afterSend = (id: string) => { setMsg(`Sent (upload ${id}). Checking it now…`); setTimeout(load, 1500) }
+  // reload the preview whenever another upload becomes READY, so its rows show up
+  const readyCount = uploads.filter((u) => u.status === 'READY').length
+
+  const afterSend = (id: string) => { setMsg(`Sent ${table.label} (upload ${id}). Checking it now…`); setTimeout(load, 1500) }
 
   if (!isAdmin) {
     return <><h1>Upload data</h1><div className="card notice">Only users in the <b>admin</b> group can upload data.</div></>
@@ -59,14 +60,38 @@ export default function Upload() {
     <>
       <h1>Upload data</h1>
       <p className="muted">
-        New orders are checked first. Valid ones are loaded into Redshift by the next pipeline run,
-        then they appear on the dashboard and in QuickSight.
+        Pick a table, then upload a CSV or enter one row. Every row is checked first. Valid rows are loaded
+        into Redshift by the next pipeline run; a row with an existing id replaces the old one.
       </p>
       {msg && <div className="card notice" style={{ marginBottom: 16 }}>{msg}</div>}
 
-      <section className="grid2">
-        <CsvUpload idToken={idToken} onSent={afterSend} />
-        <OrderForm idToken={idToken} onSent={afterSend} />
+      <section className="upload-layout">
+        <div className="card">
+          <h3>1. Choose a table</h3>
+          <div className="table-pills">
+            {TABLES.map((t) => (
+              <button key={t.name} className={`pill ${t.name === table.name ? 'active' : ''}`}
+                onClick={() => { setTable(t); setMsg('') }}>{t.label}</button>
+            ))}
+          </div>
+          <p className="muted small" style={{ marginTop: 12 }}>{table.about}</p>
+          <p className="small"><b>Columns</b> (<span className="req">*</span> required):</p>
+          <ul className="col-list small">
+            {table.columns.map((col) => (
+              <li key={col.name}><code>{col.name}</code>{col.required && <span className="req">*</span>}
+                <span className="muted"> {hint(col)}</span></li>
+            ))}
+          </ul>
+        </div>
+
+        <div className="card">
+          <h3>2. Add data to <span className="accent">{table.label}</span></h3>
+          <AddData key={table.name} table={table} idToken={idToken} onSent={afterSend} />
+        </div>
+      </section>
+
+      <section className="card" style={{ marginTop: 16 }}>
+        <TablePreview key={`${table.name}-${readyCount}`} table={table} idToken={idToken} />
       </section>
 
       <section className="card" style={{ marginTop: 16 }}>
@@ -82,15 +107,45 @@ export default function Upload() {
   )
 }
 
-function CsvUpload({ idToken, onSent }: { idToken: string; onSent: (id: string) => void }) {
+function hint(col: Column) {
+  if (col.ref) return `must exist in ${col.ref}s`
+  switch (col.kind) {
+    case 'id': return '32 characters 0-9 a-f'
+    case 'ts': return 'date/time, e.g. 2018-10-25 14:30:00'
+    case 'zip': return '5 digits'
+    case 'state': return 'state code, e.g. SP'
+    case 'enum': return (col.values ?? []).join(' / ')
+    case 'int': return 'whole number'
+    case 'num': return 'number'
+    default: return ''
+  }
+}
+
+function AddData({ table, idToken, onSent }: { table: TableSpec; idToken: string; onSent: (id: string) => void }) {
+  const [mode, setMode] = useState<'csv' | 'row'>('row')
+  return (
+    <>
+      <div className="tabs">
+        <button className={mode === 'row' ? 'active' : ''} onClick={() => setMode('row')}>Enter one row</button>
+        <button className={mode === 'csv' ? 'active' : ''} onClick={() => setMode('csv')}>Upload CSV</button>
+      </div>
+      {mode === 'csv'
+        ? <CsvUpload table={table} idToken={idToken} onSent={onSent} />
+        : <RowForm table={table} idToken={idToken} onSent={onSent} />}
+    </>
+  )
+}
+
+function CsvUpload({ table, idToken, onSent }: { table: TableSpec; idToken: string; onSent: (id: string) => void }) {
   const [file, setFile] = useState<File | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
 
   const downloadTemplate = () => {
+    const csv = toCsv(table.columns.map((col) => col.name), [exampleRow(table)])
     const a = document.createElement('a')
-    a.href = URL.createObjectURL(new Blob([templateCsv()], { type: 'text/csv' }))
-    a.download = 'olist_orders_template.csv'
+    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }))
+    a.download = `olist_${table.name}_template.csv`
     a.click()
     URL.revokeObjectURL(a.href)
   }
@@ -99,7 +154,7 @@ function CsvUpload({ idToken, onSent }: { idToken: string; onSent: (id: string) 
     if (!file) return
     setBusy(true); setError('')
     try {
-      onSent(await sendCsv(file.name, file, idToken))
+      onSent(await sendCsv(table.name, file.name, file, idToken))
       setFile(null)
     } catch (e) {
       setError((e as Error).message)
@@ -109,45 +164,49 @@ function CsvUpload({ idToken, onSent }: { idToken: string; onSent: (id: string) 
   }
 
   return (
-    <div className="card">
-      <h3>Upload a CSV file</h3>
-      <p className="muted small">One row per item. Rows with the same <code>order_id</code> are one order. Up to 500 rows.</p>
-      <button className="btn small ghost" onClick={downloadTemplate}>Download template</button>
+    <>
+      <p className="muted small">The first row must be the column names of <b>{table.label}</b>. Up to 1000 rows.
+        The template has the right columns and one example row.</p>
+      <button className="btn small ghost" onClick={downloadTemplate}>Download {table.label} template</button>
       <div className="form-row" style={{ marginTop: 12 }}>
         <input type="file" accept=".csv,text/csv" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
       </div>
       <button className="btn" disabled={!file || busy} onClick={send}>{busy ? 'Uploading…' : 'Upload'}</button>
       {error && <p className="error">{error}</p>}
-    </div>
+    </>
   )
 }
 
-function OrderForm({ idToken, onSent }: { idToken: string; onSent: (id: string) => void }) {
-  const [customer, setCustomer] = useState(CUSTOMERS[0].id)
-  const [status, setStatus] = useState('delivered')
-  const [purchase, setPurchase] = useState(today())
-  const [estimated, setEstimated] = useState(plusDays(today(), 15))
-  const [delivered, setDelivered] = useState(today())
-  const [payment, setPayment] = useState('credit_card')
-  const [installments, setInstallments] = useState('1')
-  const [items, setItems] = useState<Item[]>([{ product_id: PRODUCTS[0].id, seller_id: SELLERS[0].id, price: '99.90', freight_value: '15.00' }])
+/** Starting values: a fresh id for new keys, examples elsewhere. */
+function startValues(table: TableSpec) {
+  return Object.fromEntries(table.columns.map((col) => {
+    if (col.kind === 'id' && !col.ref && !col.example) return [col.name, newId()]
+    if (col.kind === 'ts') return [col.name, col.example ? col.example.slice(0, 16).replace(' ', 'T') : '']
+    return [col.name, col.example]
+  }))
+}
+
+function RowForm({ table, idToken, onSent }: { table: TableSpec; idToken: string; onSent: (id: string) => void }) {
+  const [values, setValues] = useState<Record<string, string>>(() => startValues(table))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-
-  const setItem = (i: number, patch: Partial<Item>) => setItems(items.map((it, j) => (j === i ? { ...it, ...patch } : it)))
-  const total = items.reduce((s, it) => s + (Number(it.price) || 0) + (Number(it.freight_value) || 0), 0)
+  const set = (name: string, v: string) => setValues({ ...values, [name]: v })
 
   const send = async () => {
+    const empty = table.columns.filter((col) => col.required && !values[col.name]?.trim())
+    if (empty.length) { setError(`Please fill in: ${empty.map((col) => col.name).join(', ')}`); return }
     setBusy(true); setError('')
     try {
-      const orderId = newOrderId()
-      const rows = items.map((it) => ({
-        ...it, order_id: orderId, customer_id: customer, order_status: status,
-        order_purchase_timestamp: `${purchase} 12:00:00`, order_estimated_delivery_date: estimated,
-        order_delivered_customer_date: status === 'delivered' ? delivered : '',
-        payment_type: payment, payment_installments: installments,
+      const row = Object.fromEntries(table.columns.map((col) => {
+        const v = (values[col.name] ?? '').trim()
+        return [col.name, col.kind === 'ts' && v ? `${v.replace('T', ' ')}:00`.slice(0, 19) : v]
       }))
-      onSent(await sendCsv(`form_order_${orderId.slice(0, 8)}.csv`, new Blob([toCsv(rows)], { type: 'text/csv' }), idToken))
+      const keyCol = table.columns[0].name
+      const id = await sendCsv(table.name, `form_${table.name}_${row[keyCol].slice(0, 8)}.csv`,
+        new Blob([toCsv(table.columns.map((col) => col.name), [row])], { type: 'text/csv' }), idToken)
+      if (table.makes) rememberId(table.makes, row[keyCol])
+      onSent(id)
+      setValues(startValues(table))  // ready for the next row, with new ids
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -156,51 +215,99 @@ function OrderForm({ idToken, onSent }: { idToken: string; onSent: (id: string) 
   }
 
   return (
-    <div className="card">
-      <h3>Enter one order</h3>
+    <>
       <div className="form-grid">
-        <label>Customer
-          <select value={customer} onChange={(e) => setCustomer(e.target.value)}>
-            {CUSTOMERS.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
-          </select>
-        </label>
-        <label>Status
-          <select value={status} onChange={(e) => setStatus(e.target.value)}>
-            {STATUSES.map((s) => <option key={s}>{s}</option>)}
-          </select>
-        </label>
-        <label>Purchase date<input type="date" value={purchase} max={today()} onChange={(e) => setPurchase(e.target.value)} /></label>
-        <label>Estimated delivery<input type="date" value={estimated} onChange={(e) => setEstimated(e.target.value)} /></label>
-        {status === 'delivered' && (
-          <label>Delivered on<input type="date" value={delivered} onChange={(e) => setDelivered(e.target.value)} /></label>
-        )}
-        <label>Payment
-          <select value={payment} onChange={(e) => setPayment(e.target.value)}>
-            {PAYMENT_TYPES.map((p) => <option key={p}>{p}</option>)}
-          </select>
-        </label>
-        <label>Installments<input type="number" min={1} max={24} value={installments} onChange={(e) => setInstallments(e.target.value)} /></label>
+        {table.columns.map((col) => (
+          <label key={col.name} className={col.kind === 'text' ? 'wide' : ''}>
+            <span>{col.name}{col.required && <span className="req">*</span>}</span>
+            <Field col={col} value={values[col.name] ?? ''} onChange={(v) => set(col.name, v)} />
+          </label>
+        ))}
       </div>
-
-      {items.map((it, i) => (
-        <div key={i} className="item-row">
-          <select value={it.product_id} onChange={(e) => setItem(i, { product_id: e.target.value })} aria-label="Product">
-            {PRODUCTS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
-          </select>
-          <select value={it.seller_id} onChange={(e) => setItem(i, { seller_id: e.target.value })} aria-label="Seller">
-            {SELLERS.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
-          </select>
-          <input type="number" min={0.01} step={0.01} value={it.price} onChange={(e) => setItem(i, { price: e.target.value })} aria-label="Price" placeholder="Price" />
-          <input type="number" min={0} step={0.01} value={it.freight_value} onChange={(e) => setItem(i, { freight_value: e.target.value })} aria-label="Freight" placeholder="Freight" />
-          {items.length > 1 && <button className="btn small ghost" onClick={() => setItems(items.filter((_, j) => j !== i))}>✕</button>}
-        </div>
-      ))}
-      <div className="row-between" style={{ marginTop: 8 }}>
-        <button className="btn small ghost" onClick={() => setItems([...items, { ...items[items.length - 1] }])}>+ Add item</button>
-        <span className="muted">Total R$ {total.toFixed(2)}</span>
-      </div>
-      <button className="btn" style={{ marginTop: 12 }} disabled={busy} onClick={send}>{busy ? 'Sending…' : 'Submit order'}</button>
+      <button className="btn" disabled={busy} onClick={send}>{busy ? 'Sending…' : `Add to ${table.label}`}</button>
       {error && <p className="error">{error}</p>}
+    </>
+  )
+}
+
+function Field({ col, value, onChange }: { col: Column; value: string; onChange: (v: string) => void }) {
+  if (col.kind === 'enum' || col.kind === 'state') {
+    const options = col.kind === 'state' ? STATES : col.values ?? []
+    return (
+      <select value={value} onChange={(e) => onChange(e.target.value)}>
+        {!col.required && <option value="">(empty)</option>}
+        {options.map((o) => <option key={o}>{o}</option>)}
+      </select>
+    )
+  }
+  if (col.kind === 'ts') {
+    return <input type="datetime-local" value={value} onChange={(e) => onChange(e.target.value)} />
+  }
+  if (col.kind === 'int' || col.kind === 'num') {
+    return <input type="number" step={col.kind === 'int' ? 1 : 'any'} value={value} onChange={(e) => onChange(e.target.value)} />
+  }
+  if (col.ref) {
+    const listId = `list-${col.ref}`
+    const options = [...recentIds(col.ref), ...(SUGGESTIONS[col.ref] ?? [])]
+    return (
+      <>
+        <input type="text" list={listId} value={value} onChange={(e) => onChange(e.target.value)} placeholder={`pick or paste a ${col.ref}`} />
+        <datalist id={listId}>{options.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}</datalist>
+      </>
+    )
+  }
+  if (col.kind === 'id') {
+    return (
+      <div className="id-field">
+        <input type="text" value={value} onChange={(e) => onChange(e.target.value)} />
+        <button type="button" className="btn small ghost" onClick={() => onChange(newId())} title="Generate a new id">New</button>
+      </div>
+    )
+  }
+  return <input type="text" value={value} onChange={(e) => onChange(e.target.value)} />
+}
+
+function TablePreview({ table, idToken }: { table: TableSpec; idToken: string }) {
+  const [data, setData] = useState<Preview | null>(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    apiGet<Preview>(`/preview?table=${table.name}`, idToken).then(setData).catch((e: Error) => setError(e.message))
+  }, [table.name, idToken])
+
+  const columns = table.columns.map((col) => col.name)
+  return (
+    <>
+      <h3>Preview: {table.label}</h3>
+      {error && <p className="error">Could not load the preview: {error}</p>}
+      {!error && !data && <p className="muted">Loading…</p>}
+      {data && (
+        <>
+          <p className="small"><b>Added from the website</b> <span className="muted">(newest first, waiting for or already in Redshift)</span></p>
+          {data.uploaded.length === 0
+            ? <p className="muted small">Nothing uploaded to this table yet.</p>
+            : <RowsTable columns={columns} rows={data.uploaded} />}
+          <p className="small" style={{ marginTop: 16 }}><b>Original Olist data</b> <span className="muted">(first {data.sample.length} rows)</span></p>
+          <RowsTable columns={columns} rows={data.sample} />
+        </>
+      )}
+    </>
+  )
+}
+
+function RowsTable({ columns, rows }: { columns: string[]; rows: Record<string, unknown>[] }) {
+  const show = (v: unknown) => {
+    const s = v == null ? '' : String(v)
+    return /^[0-9a-f]{32}$/.test(s) ? <span title={s}>{s.slice(0, 8)}…</span> : s
+  }
+  return (
+    <div className="table-wrap">
+      <table className="table">
+        <thead><tr>{columns.map((col) => <th key={col}>{col}</th>)}</tr></thead>
+        <tbody>
+          {rows.map((r, i) => <tr key={i}>{columns.map((col) => <td key={col}>{show(r[col])}</td>)}</tr>)}
+        </tbody>
+      </table>
     </div>
   )
 }
@@ -210,17 +317,17 @@ function UploadTable({ rows }: { rows: UploadRow[] }) {
     <div className="table-wrap">
       <table className="table">
         <thead>
-          <tr><th>When</th><th>File</th><th>By</th><th>Status</th><th>Orders</th><th>Value (R$)</th><th>Details</th></tr>
+          <tr><th>When</th><th>Table</th><th>File</th><th>By</th><th>Status</th><th>Rows</th><th>Details</th></tr>
         </thead>
         <tbody>
           {rows.map((u) => (
             <tr key={u.upload_id}>
               <td>{new Date(u.created_at).toLocaleString()}</td>
+              <td>{u.table_name ?? 'orders'}</td>
               <td>{u.filename}</td>
               <td>{u.user_email}</td>
               <td><span className={`status ${u.status.toLowerCase()}`}>{u.status}</span></td>
-              <td>{u.order_count ?? '–'}</td>
-              <td>{u.total_value ? Number(u.total_value).toLocaleString(undefined, { minimumFractionDigits: 2 }) : '–'}</td>
+              <td>{u.row_count ?? u.order_count ?? '–'}</td>
               <td>
                 {u.message}
                 {u.errors && u.errors.length > 0 && (

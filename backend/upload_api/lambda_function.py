@@ -1,17 +1,22 @@
 """olist_upload_api: the website's upload endpoints (behind the Cognito JWT authorizer).
 
-  POST /uploads   {"filename": "my_orders.csv"}   admin only
+  POST /uploads   {"table": "orders", "filename": "my_orders.csv"}   admin only
       -> creates a record in DynamoDB (status WAITING_FILE)
       -> returns a presigned S3 URL; the browser PUTs the CSV straight to
-         s3://<BUCKET>/raw/uploads_incoming/<upload_id>.csv  (valid 5 minutes)
-  GET  /uploads   -> the 20 most recent uploads with their status (any logged-in user)
+         s3://<BUCKET>/raw/uploads_incoming/<table>/<upload_id>.csv  (valid 5 minutes)
+  GET  /uploads                 -> the 20 most recent uploads with their status
+  GET  /preview?table=orders    -> rows to show above the upload form:
+         "uploaded": the latest rows added from the website for that table
+         "sample":   the first rows of the original Olist file in raw/<table>/
 
-The CSV is then checked by the olist_upload_validator Lambda (S3 trigger).
+The CSV is then checked by the upload validator Lambda (S3 trigger).
 
 Environment variables:
   BUCKET   olistcap-data-2026
   TABLE    olist_uploads
 """
+import csv
+import io
 import json
 import os
 import re
@@ -22,9 +27,13 @@ import boto3
 from botocore.config import Config
 
 BUCKET = os.environ["BUCKET"]
-TABLE = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+DDB = boto3.resource("dynamodb").Table(os.environ["TABLE"])
 s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"),
                   config=Config(signature_version="s3v4"))
+
+TABLES = ["orders", "order_items", "payments", "reviews", "customers", "sellers", "products",
+          "category_translation", "geolocation"]
+PREVIEW_ROWS = 10
 
 
 def reply(status, body):
@@ -43,16 +52,20 @@ def create_upload(event):
         return reply(403, {"error": "Only users in the admin group can upload data."})
 
     body = json.loads(event.get("body") or "{}")
+    table = body.get("table")
+    if table not in TABLES:
+        return reply(400, {"error": f"table must be one of {', '.join(TABLES)}"})
     filename = re.sub(r"[^A-Za-z0-9._-]", "_", str(body.get("filename") or "upload.csv"))[:80]
     if not filename.lower().endswith(".csv"):
         return reply(400, {"error": "Only .csv files can be uploaded."})
 
     upload_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + secrets.token_hex(3)
-    key = f"raw/uploads_incoming/{upload_id}.csv"
-    TABLE.put_item(Item={
+    key = f"raw/uploads_incoming/{table}/{upload_id}.csv"
+    DDB.put_item(Item={
         "upload_id": upload_id,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "user_email": claims.get("email", ""),
+        "table_name": table,
         "filename": filename,
         "s3_key": key,
         "status": "WAITING_FILE",
@@ -69,13 +82,54 @@ def create_upload(event):
 def list_uploads():
     items, kwargs = [], {}
     while True:  # small table: a full scan is fine
-        page = TABLE.scan(**kwargs)
+        page = DDB.scan(**kwargs)
         items += page["Items"]
         if "LastEvaluatedKey" not in page:
             break
         kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
     items.sort(key=lambda i: i.get("created_at", ""), reverse=True)
     return reply(200, {"uploads": items[:20]})
+
+
+def sample_rows(table):
+    """First rows of the original Olist CSV. Only the first 64 KB is downloaded."""
+    objs = s3.list_objects_v2(Bucket=BUCKET, Prefix=f"raw/{table}/").get("Contents", [])
+    files = [o["Key"] for o in objs if o["Key"].endswith(".csv")]
+    if not files:
+        return [], []
+    head = s3.get_object(Bucket=BUCKET, Key=files[0], Range="bytes=0-65535")["Body"].read()
+    text = head.decode("utf-8-sig", "replace")
+    text = text[: text.rfind("\n")]  # drop the last, probably cut, line
+    reader = csv.DictReader(io.StringIO(text))
+    columns = [c.strip().strip('"') for c in (reader.fieldnames or [])]
+    reader.fieldnames = columns
+    rows = []
+    for row in reader:
+        rows.append(row)
+        if len(rows) == PREVIEW_ROWS:
+            break
+    return columns, rows
+
+
+def uploaded_rows(table):
+    """Latest rows added from the website (newest upload first)."""
+    objs = s3.list_objects_v2(Bucket=BUCKET, Prefix=f"raw/upload_{table}/").get("Contents", [])
+    rows = []
+    for obj in sorted(objs, key=lambda o: o["LastModified"], reverse=True):
+        body = s3.get_object(Bucket=BUCKET, Key=obj["Key"])["Body"].read().decode("utf-8")
+        rows += [json.loads(line) for line in body.splitlines() if line.strip()][::-1]
+        if len(rows) >= PREVIEW_ROWS:
+            break
+    return rows[:PREVIEW_ROWS]
+
+
+def preview(event):
+    table = (event.get("queryStringParameters") or {}).get("table")
+    if table not in TABLES:
+        return reply(400, {"error": f"table must be one of {', '.join(TABLES)}"})
+    columns, sample = sample_rows(table)
+    return reply(200, {"table": table, "columns": columns, "sample": sample,
+                       "uploaded": uploaded_rows(table)})
 
 
 def lambda_handler(event, context):
@@ -85,6 +139,8 @@ def lambda_handler(event, context):
             return create_upload(event)
         if route == "GET /uploads":
             return list_uploads()
+        if route == "GET /preview":
+            return preview(event)
         return reply(404, {"error": f"unknown route {route}"})
     except Exception as e:  # shown on the website and in CloudWatch logs
         print(f"ERROR {e}")

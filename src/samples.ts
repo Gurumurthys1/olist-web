@@ -1,6 +1,8 @@
-// Real customers, products and sellers from the Olist data (they exist in Redshift),
-// so a new order made in the form or the template passes the validator's checks.
-export const CUSTOMERS = [
+// Real ids from the Olist data (they exist in Redshift). The form offers them as suggestions,
+// so a new row that points to a customer / product / seller / order passes the validator.
+export type Option = { id: string; label: string }
+
+export const CUSTOMERS: Option[] = [
   { id: '06b8999e2fba1a1fbc88172c00ba8bc7', label: 'Franca, SP' },
   { id: '5aa9e4fdd4dfd20959cad2d772509598', label: 'Rio de Janeiro, RJ' },
   { id: '5e274e7a0c3809e14aba7ad5aae0d407', label: 'Timoteo, MG' },
@@ -13,7 +15,7 @@ export const CUSTOMERS = [
   { id: 'b80adce6a72fc096b80a540312a24a95', label: 'Paulista, PE' },
 ]
 
-export const PRODUCTS = [
+export const PRODUCTS: Option[] = [
   { id: 'e3e020af31d4d89d2602272b315c3f6e', label: 'health_beauty' },
   { id: '3e9b58f1436820c248d3f98d7229bb14', label: 'watches_gifts' },
   { id: '14aa47b7fe5c25522b47b4b29c98dcb9', label: 'bed_bath_table' },
@@ -26,7 +28,7 @@ export const PRODUCTS = [
   { id: '1e9e8ef04dbcff4541ed26657ea517e5', label: 'perfumery' },
 ]
 
-export const SELLERS = [
+export const SELLERS: Option[] = [
   { id: '3442f8959a84dea7ee197c632cb2df15', label: 'Campinas, SP' },
   { id: 'ce3ad9de960102d0677a81f5d0bb7b2d', label: 'Rio de Janeiro, RJ' },
   { id: '2a1348e9addc1af5aaa619b1a3679d6b', label: 'Belo Horizonte, MG' },
@@ -35,38 +37,48 @@ export const SELLERS = [
   { id: '8bd0e3abda539b9479c4b44a691be1ec', label: 'Tres de Maio, RS' },
 ]
 
-export const PAYMENT_TYPES = ['credit_card', 'boleto', 'debit_card', 'voucher']
-export const STATUSES = ['delivered', 'shipped', 'processing', 'approved', 'canceled']
-
-export const CSV_COLUMNS = [
-  'order_id', 'customer_id', 'order_status', 'order_purchase_timestamp',
-  'order_estimated_delivery_date', 'order_delivered_customer_date',
-  'product_id', 'seller_id', 'price', 'freight_value', 'payment_type', 'payment_installments',
+export const ORDERS: Option[] = [
+  { id: 'e481f51cbdc54678b7cc49136f2d6af7', label: 'order from 2017-10-02 (history)' },
 ]
 
-/** A new order id in the Olist format: 32 random hex characters. */
-export function newOrderId() {
+export const CATEGORIES: Option[] = [
+  'perfumaria', 'beleza_saude', 'esporte_lazer', 'informatica_acessorios', 'moveis_decoracao',
+  'utilidades_domesticas', 'brinquedos', 'telefonia', 'relogios_presentes', 'cama_mesa_banho',
+].map((c) => ({ id: c, label: c }))
+
+export const SUGGESTIONS: Record<string, Option[]> = {
+  customer: CUSTOMERS, product: PRODUCTS, seller: SELLERS, order: ORDERS, category: CATEGORIES,
+}
+
+/** A new id in the Olist format: 32 random hex characters. */
+export function newId() {
   const bytes = crypto.getRandomValues(new Uint8Array(16))
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
-export function toCsv(rows: Record<string, string>[]) {
+export function toCsv(columns: string[], rows: Record<string, string>[]) {
   const cell = (v: string) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v)
-  return [CSV_COLUMNS.join(','), ...rows.map((r) => CSV_COLUMNS.map((c) => cell(r[c] ?? '')).join(','))].join('\n') + '\n'
+  return [columns.join(','), ...rows.map((r) => columns.map((c) => cell(r[c] ?? '')).join(','))].join('\n') + '\n'
 }
 
-/** Template: two orders (the first has two items), with fresh order ids. */
-export function templateCsv() {
-  const a = newOrderId()
-  const b = newOrderId()
-  const base = {
-    order_status: 'delivered', order_purchase_timestamp: '2018-10-25 14:30:00',
-    order_estimated_delivery_date: '2018-11-10', order_delivered_customer_date: '2018-11-02',
-    payment_type: 'credit_card', payment_installments: '3',
+// ids you created with the form in this browser, offered as suggestions in the next forms
+const RECENT_KEY = 'olist-recent-ids'
+
+export function recentIds(kind: string): Option[] {
+  try {
+    const all = JSON.parse(localStorage.getItem(RECENT_KEY) || '{}') as Record<string, string[]>
+    return (all[kind] ?? []).map((id) => ({ id, label: 'added by you' }))
+  } catch {
+    return []
   }
-  return toCsv([
-    { ...base, order_id: a, customer_id: CUSTOMERS[0].id, product_id: PRODUCTS[0].id, seller_id: SELLERS[0].id, price: '129.90', freight_value: '15.50' },
-    { ...base, order_id: a, customer_id: CUSTOMERS[0].id, product_id: PRODUCTS[1].id, seller_id: SELLERS[0].id, price: '89.00', freight_value: '12.00' },
-    { ...base, order_id: b, customer_id: CUSTOMERS[1].id, product_id: PRODUCTS[2].id, seller_id: SELLERS[1].id, price: '249.00', freight_value: '22.30', payment_type: 'boleto', payment_installments: '1' },
-  ])
+}
+
+export function rememberId(kind: string, id: string) {
+  try {
+    const all = JSON.parse(localStorage.getItem(RECENT_KEY) || '{}') as Record<string, string[]>
+    all[kind] = [id, ...(all[kind] ?? []).filter((x) => x !== id)].slice(0, 10)
+    localStorage.setItem(RECENT_KEY, JSON.stringify(all))
+  } catch {
+    // storage blocked: suggestions just will not include your own ids
+  }
 }
