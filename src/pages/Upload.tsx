@@ -40,8 +40,9 @@ export default function Upload() {
 
   useEffect(() => { if (config.apiUrl) load() }, [load])
 
-  // while a file is still being checked, refresh the list every 4 seconds
-  const busy = uploads.some((u) => u.status === 'WAITING_FILE' || u.status === 'VALIDATING')
+  // while a recent file (last 5 minutes) is still being checked, refresh the list every 4 seconds
+  const busy = uploads.some((u) => (u.status === 'WAITING_FILE' || u.status === 'VALIDATING')
+    && Date.now() - new Date(u.created_at).getTime() < 5 * 60 * 1000)
   useEffect(() => {
     if (!busy) return
     const t = setInterval(load, 4000)

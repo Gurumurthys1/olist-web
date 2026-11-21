@@ -116,9 +116,10 @@ def check_rows(rows):
             delivered = parse_ts(row["order_delivered_customer_date"])
             if not delivered:
                 bad("order_delivered_customer_date is not a valid date")
-        if purchase and delivered and delivered < purchase:
+        # compare whole days: delivered "2026-11-21" on the purchase day is fine
+        if purchase and delivered and delivered.date() < purchase.date():
             bad("order_delivered_customer_date is before the purchase")
-        if purchase and estimated and estimated < purchase:
+        if purchase and estimated and estimated.date() < purchase.date():
             bad("order_estimated_delivery_date is before the purchase")
         if status == "delivered" and not delivered:
             bad("a delivered order needs order_delivered_customer_date")
