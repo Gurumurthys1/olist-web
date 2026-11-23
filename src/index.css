@@ -112,6 +112,11 @@ input[type='text'], input[type='datetime-local'] {
 .status.ready, .status.loaded { background: #e6fcf5; color: #087f5b; }
 .status.rejected { background: #fff5f5; color: var(--danger); }
 .status.validating, .status.waiting_file, .status.processing { background: #fff9db; color: #e67700; }
+.status.succeeded { background: #e6fcf5; color: #087f5b; }
+.status.running { background: #fff9db; color: #e67700; }
+.status.failed, .status.timed_out, .status.aborted { background: #fff5f5; color: var(--danger); }
+.pipeline { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+.pipeline p { margin: 0 0 4px; }
 .errors { margin: 4px 0 0; padding-left: 18px; color: var(--danger); }
 .placeholder {
   min-height: 220px; display: flex; align-items: center; justify-content: center; color: var(--muted);

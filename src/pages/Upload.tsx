@@ -10,6 +10,8 @@ type UploadRow = {
   status: string; message: string; errors?: string[]; row_count?: string; order_count?: string
 }
 type Preview = { columns: string[]; sample: Record<string, unknown>[]; uploaded: Record<string, unknown>[] }
+type PipelineRun = { name?: string; status: string; started?: string; stopped?: string | null }
+type UploadsReply = { uploads: UploadRow[]; ready_count?: number; pipeline?: PipelineRun | null }
 
 /** Ask the API for a presigned URL, then send the CSV straight to S3. */
 async function sendCsv(table: string, filename: string, csv: Blob, idToken: string) {
@@ -29,26 +31,33 @@ export default function Upload() {
   const [uploads, setUploads] = useState<UploadRow[]>([])
   const [listError, setListError] = useState('')
   const [msg, setMsg] = useState('')
+  const [readyTotal, setReadyTotal] = useState(0)
+  const [pipeline, setPipeline] = useState<PipelineRun | null>(null)
 
   const load = useCallback(() => {
-    apiGet<{ uploads: UploadRow[] }>('/uploads', idToken)
-      .then((r) => { setUploads(r.uploads); setListError('') })
+    apiGet<UploadsReply>('/uploads', idToken)
+      .then((r) => {
+        setUploads(r.uploads); setListError('')
+        setReadyTotal(r.ready_count ?? 0); setPipeline(r.pipeline ?? null)
+      })
       .catch((e: Error) => setListError(e.message))
   }, [idToken])
 
   useEffect(() => { if (config.apiUrl) load() }, [load])
 
-  // while a recent file (last 5 minutes) is still being checked, refresh the list every 4 seconds
+  // refresh the list every 4 s while a recent file (last 5 minutes) is being checked,
+  // and every 15 s while the pipeline runs
   const busy = uploads.some((u) => (u.status === 'WAITING_FILE' || u.status === 'VALIDATING')
     && Date.now() - new Date(u.created_at).getTime() < 5 * 60 * 1000)
+  const running = pipeline?.status === 'RUNNING'
   useEffect(() => {
-    if (!busy) return
-    const t = setInterval(load, 4000)
+    if (!busy && !running) return
+    const t = setInterval(load, busy ? 4000 : 15000)
     return () => clearInterval(t)
-  }, [busy, load])
+  }, [busy, running, load])
 
-  // reload the preview whenever another upload becomes READY, so its rows show up
-  const readyCount = uploads.filter((u) => u.status === 'READY').length
+  // reload the preview whenever an upload becomes READY or LOADED, so its rows show up
+  const readyCount = uploads.filter((u) => u.status === 'READY' || u.status === 'LOADED').length
 
   const afterSend = (id: string) => { setMsg(`Sent ${table.label} (upload ${id}). Checking it now…`); setTimeout(load, 1500) }
 
@@ -61,9 +70,11 @@ export default function Upload() {
       <h1>Upload data</h1>
       <p className="muted">
         Pick a table, then upload a CSV or enter one row. Every row is checked first. Valid rows are loaded
-        into Redshift by the next pipeline run; a row with an existing id replaces the old one.
+        into Redshift and QuickSight automatically; a row with an existing id replaces the old one.
       </p>
       {msg && <div className="card notice" style={{ marginBottom: 16 }}>{msg}</div>}
+
+      <PipelineCard run={pipeline} readyTotal={readyTotal} idToken={idToken} onStarted={(m) => { setMsg(m); setTimeout(load, 2000) }} />
 
       <section className="upload-layout">
         <div className="card">
@@ -104,6 +115,53 @@ export default function Upload() {
         {uploads.length > 0 && <UploadTable rows={uploads} />}
       </section>
     </>
+  )
+}
+
+const STEPS = 'API ingest → Glue job 1 → Glue job 2 → Redshift load → mark uploads LOADED + QuickSight refresh'
+
+function PipelineCard({ run, readyTotal, idToken, onStarted }: {
+  run: PipelineRun | null; readyTotal: number; idToken: string; onStarted: (msg: string) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const running = run?.status === 'RUNNING'
+
+  const start = async () => {
+    if (!window.confirm(`Start the pipeline now?\n\n${STEPS}\n\nIt takes about 10–15 minutes.`)) return
+    setBusy(true); setError('')
+    try {
+      const r = await apiPost<{ started: string }>('/process', {}, idToken)
+      onStarted(`Pipeline started (${r.started}). This page updates by itself; it takes about 10–15 minutes.`)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const when = (s?: string | null) => (s ? new Date(s).toLocaleString() : '')
+  return (
+    <section className="card pipeline">
+      <div>
+        <h3>Load into Redshift</h3>
+        <p className="small">
+          A valid upload starts the pipeline by itself (Redshift, then QuickSight). It also runs every night at 02:00
+          with the new API data. <b>{readyTotal}</b> upload(s) READY, waiting to load.
+        </p>
+        {run && run.status !== 'NEVER_RUN' && (
+          <p className="small muted">
+            Last run: <span className={`status ${run.status.toLowerCase()}`}>{run.status}</span>{' '}
+            started {when(run.started)}{run.stopped ? `, finished ${when(run.stopped)}` : ''}
+          </p>
+        )}
+        {run === null && <p className="small muted">Pipeline status is not connected yet (PIPELINE_ARN).</p>}
+        {error && <p className="error small">{error}</p>}
+      </div>
+      <button className="btn" disabled={busy || running} onClick={start}>
+        {running ? 'Running…' : busy ? 'Starting…' : 'Process now'}
+      </button>
+    </section>
   )
 }
 

@@ -14,12 +14,15 @@ If the key already exists, the uploaded row REPLACES the old one when the pipeli
 
 All rows valid -> raw/upload_<table>/upload_id=<id>/data.jsonl, which Glue job 1 reads with
 data_source = 'upload'. One bad row rejects the whole file. The result goes to DynamoDB.
+Then, if PIPELINE_ARN is set, the pipeline starts by itself (Redshift + QuickSight update).
+If a run is already going, the upload waits; the pipeline's last step starts one more run.
 
 Environment variables:
-  TABLE       olist_uploads
-  WORKGROUP   olistcap-wg
-  DATABASE    dev
-  SECRET_ARN  ARN of the read-only Redshift secret (olist/redshift-readonly)
+  TABLE         olist_uploads
+  WORKGROUP     olistcap-wg
+  DATABASE      dev
+  SECRET_ARN    ARN of the read-only Redshift secret (olist/redshift-readonly)
+  PIPELINE_ARN  ARN of the olistcap_pipeline state machine (optional: empty = no auto start)
 """
 import csv
 import io
@@ -35,6 +38,7 @@ import boto3
 
 s3 = boto3.client("s3")
 rsd = boto3.client("redshift-data")
+sfn = boto3.client("stepfunctions")
 DDB = boto3.resource("dynamodb").Table(os.environ["TABLE"])
 
 MAX_ROWS = 1000
@@ -352,8 +356,27 @@ def validate(bucket, key):
     body = "\n".join(json.dumps(r, ensure_ascii=False) for r in clean) + "\n"
     s3.put_object(Bucket=bucket, Key=f"raw/upload_{table}/upload_id={upload_id}/data.jsonl",
                   Body=body.encode("utf-8"), ContentType="application/x-ndjson")
-    set_status(upload_id, "READY", "Valid. It will be loaded into Redshift by the next pipeline run",
-               errors=[], row_count=len(clean))
+    set_status(upload_id, "READY", f"Valid. {start_pipeline()}", errors=[], row_count=len(clean))
+
+
+def start_pipeline():
+    """Start the pipeline unless it is already running. Two uploads in the same 5 minutes get the
+    same run name, so Step Functions starts only one run for them."""
+    arn = os.environ.get("PIPELINE_ARN", "")
+    if not arn:
+        return "It will be loaded into Redshift by the next pipeline run"
+    try:
+        if sfn.list_executions(stateMachineArn=arn, statusFilter="RUNNING", maxResults=1)["executions"]:
+            return "The pipeline is busy; this upload loads in the run that follows it"
+        window = int(time.time() // 300)
+        sfn.start_execution(stateMachineArn=arn, name=f"upload-{window}",
+                            input=json.dumps({"trigger": "upload"}))
+        return "Loading into Redshift now (pipeline started, about 10-15 minutes)"
+    except sfn.exceptions.ExecutionAlreadyExists:
+        return "Loading into Redshift now (pipeline started, about 10-15 minutes)"
+    except Exception as e:  # the data is safe; the nightly run will load it
+        print(f"could not start the pipeline: {e}")
+        return "It will be loaded into Redshift by the next pipeline run"
 
 
 def lambda_handler(event, context):

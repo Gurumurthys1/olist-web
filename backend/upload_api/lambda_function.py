@@ -4,16 +4,20 @@
       -> creates a record in DynamoDB (status WAITING_FILE)
       -> returns a presigned S3 URL; the browser PUTs the CSV straight to
          s3://<BUCKET>/raw/uploads_incoming/<table>/<upload_id>.csv  (valid 5 minutes)
-  GET  /uploads                 -> the 20 most recent uploads with their status
+  GET  /uploads                 -> the 20 most recent uploads with their status,
+                                   plus the latest pipeline run (if PIPELINE_ARN is set)
   GET  /preview?table=orders    -> rows to show above the upload form:
          "uploaded": the latest rows added from the website for that table
          "sample":   the first rows of the original Olist file in raw/<table>/
+  POST /process                 -> "Process now": starts the olistcap_pipeline state machine
+                                   (admin only; refused while a run is still going)
 
 The CSV is then checked by the upload validator Lambda (S3 trigger).
 
 Environment variables:
-  BUCKET   olistcap-data-2026
-  TABLE    olist_uploads
+  BUCKET        olistcap-data-2026
+  TABLE         olist_uploads
+  PIPELINE_ARN  ARN of the olistcap_pipeline state machine (optional until Phase 5)
 """
 import csv
 import io
@@ -30,6 +34,9 @@ BUCKET = os.environ["BUCKET"]
 DDB = boto3.resource("dynamodb").Table(os.environ["TABLE"])
 s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"),
                   config=Config(signature_version="s3v4"))
+
+PIPELINE_ARN = os.environ.get("PIPELINE_ARN", "")
+sfn = boto3.client("stepfunctions")
 
 TABLES = ["orders", "order_items", "payments", "reviews", "customers", "sellers", "products",
           "category_translation", "geolocation"]
@@ -88,7 +95,37 @@ def list_uploads():
             break
         kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
     items.sort(key=lambda i: i.get("created_at", ""), reverse=True)
-    return reply(200, {"uploads": items[:20]})
+    ready = sum(1 for i in items if i.get("status") == "READY")
+    return reply(200, {"uploads": items[:20], "ready_count": ready, "pipeline": last_run()})
+
+
+def last_run():
+    """The newest pipeline run: status, start, stop. None if the pipeline is not configured."""
+    if not PIPELINE_ARN:
+        return None
+    runs = sfn.list_executions(stateMachineArn=PIPELINE_ARN, maxResults=1)["executions"]
+    if not runs:
+        return {"status": "NEVER_RUN"}
+    r = runs[0]
+    return {"name": r["name"], "status": r["status"],
+            "started": r["startDate"].isoformat(),
+            "stopped": r["stopDate"].isoformat() if r.get("stopDate") else None}
+
+
+def process_now(event):
+    claims = claims_of(event)
+    if "admin" not in str(claims.get("cognito:groups", "")):
+        return reply(403, {"error": "Only users in the admin group can start the pipeline."})
+    if not PIPELINE_ARN:
+        return reply(400, {"error": "PIPELINE_ARN is not set on the upload API Lambda."})
+    running = sfn.list_executions(stateMachineArn=PIPELINE_ARN, statusFilter="RUNNING",
+                                  maxResults=1)["executions"]
+    if running:
+        return reply(409, {"error": "The pipeline is already running. Wait for it to finish."})
+    name = "web-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + secrets.token_hex(2)
+    sfn.start_execution(stateMachineArn=PIPELINE_ARN, name=name,
+                        input=json.dumps({"trigger": "website", "by": claims.get("email", "")}))
+    return reply(200, {"started": name})
 
 
 def sample_rows(table):
@@ -141,6 +178,8 @@ def lambda_handler(event, context):
             return list_uploads()
         if route == "GET /preview":
             return preview(event)
+        if route == "POST /process":
+            return process_now(event)
         return reply(404, {"error": f"unknown route {route}"})
     except Exception as e:  # shown on the website and in CloudWatch logs
         print(f"ERROR {e}")
